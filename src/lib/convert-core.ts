@@ -534,7 +534,54 @@ export const readClipboardFile = async (): Promise<string | null> => {
       return null;
     }
   }
+  const imagePath = await readClipboardImageToTemp();
+  if (imagePath) return imagePath;
   return null;
+};
+
+const readClipboardImageToTemp = async (): Promise<string | null> => {
+  if (isWindows) {
+    return await readClipboardImageWindows();
+  }
+  return await readClipboardImageMac();
+};
+
+const readClipboardImageWindows = async (): Promise<string | null> => {
+  const tempPath = path.join(os.tmpdir(), `raycast-clipboard-${randomUUID()}.png`);
+  const script = [
+    "Add-Type -AssemblyName System.Windows.Forms;",
+    "Add-Type -AssemblyName System.Drawing;",
+    "$img = [System.Windows.Forms.Clipboard]::GetImage();",
+    "if ($null -eq $img) { exit 2 }",
+    `$img.Save('${tempPath.replace(/'/g, "''")}', [System.Drawing.Imaging.ImageFormat]::Png);`,
+    "$img.Dispose();",
+  ].join(" ");
+  try {
+    await execFileAsync(
+      "powershell",
+      ["-NoProfile", "-NonInteractive", "-Command", script],
+      { windowsHide: true, maxBuffer: 1024 * 1024 },
+    );
+    await access(tempPath);
+    return tempPath;
+  } catch {
+    return null;
+  }
+};
+
+const readClipboardImageMac = async (): Promise<string | null> => {
+  const pngpaste = await findBinary("pngpaste");
+  if (!pngpaste) return null;
+  const tempPath = path.join(os.tmpdir(), `raycast-clipboard-${randomUUID()}.png`);
+  try {
+    await execFileAsync(pngpaste, [tempPath], {
+      maxBuffer: 1024 * 1024,
+    });
+    await access(tempPath);
+    return tempPath;
+  } catch {
+    return null;
+  }
 };
 
 export const formatBytes = (bytes: number) => {
