@@ -7,11 +7,52 @@
   "license": "MIT",
   "commands": [
     {
-      "name": "convert",
-      "title": "Convert",
-      "description": "Convert you one file format to another",
-      "mode": "no-view",
+      "name": "convert-clipboard",
+      "title": "Convert Clipboard File",
+      "description": "Convert a file from clipboard",
+      "mode": "view",
       "subtitle": ""
+    },
+    {
+      "name": "convert-file",
+      "title": "Convert File",
+      "description": "Convert a selected file",
+      "mode": "view",
+      "subtitle": ""
+    }
+  ],
+  "preferences": [
+    {
+      "name": "magickPath",
+      "title": "ImageMagick Path",
+      "description": "Full path to magick executable. Use this if Raycast cannot find it.",
+      "type": "textfield",
+      "required": false,
+      "placeholder": "C:\\Program Files\\ImageMagick-7.1.2-Q16-HDRI\\magick.exe"
+    },
+    {
+      "name": "ffmpegPath",
+      "title": "FFmpeg Path",
+      "description": "Full path to ffmpeg executable (optional).",
+      "type": "textfield",
+      "required": false,
+      "placeholder": "C:\\ffmpeg\\bin\\ffmpeg.exe"
+    },
+    {
+      "name": "pandocPath",
+      "title": "Pandoc Path",
+      "description": "Full path to pandoc executable (optional).",
+      "type": "textfield",
+      "required": false,
+      "placeholder": "C:\\Program Files\\Pandoc\\pandoc.exe"
+    },
+    {
+      "name": "libreofficePath",
+      "title": "LibreOffice Path",
+      "description": "Full path to soffice executable (optional).",
+      "type": "textfield",
+      "required": false,
+      "placeholder": "C:\\Program Files\\LibreOffice\\program\\soffice.exe"
     }
   ],
   "dependencies": {
