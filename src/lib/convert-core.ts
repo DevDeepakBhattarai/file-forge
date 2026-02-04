@@ -470,6 +470,8 @@ export const convertWithTool = async (opts: {
   tool: ToolFormats;
 }) => {
   const { inputPath, outputPath, outputExt, overwrite, converter, tool } = opts;
+  const inputExt = getFileExt(inputPath);
+  const outputExtNormalized = normalizeExt(outputExt);
 
   if (!overwrite) {
     try {
@@ -482,7 +484,19 @@ export const convertWithTool = async (opts: {
 
   switch (converter) {
     case "magick":
-      await runCommand(tool.bin, [inputPath, outputPath]);
+      {
+        const args: string[] = [];
+        const alphaFormats = new Set(["png", "webp", "gif", "tif", "tiff"]);
+        if (inputExt === "svg" && alphaFormats.has(outputExtNormalized)) {
+          args.push("-background", "none");
+        }
+        args.push(inputPath);
+        if (inputExt === "svg" && alphaFormats.has(outputExtNormalized)) {
+          args.push("-alpha", "on");
+        }
+        args.push(outputPath);
+        await runCommand(tool.bin, args);
+      }
       return outputPath;
     case "ffmpeg": {
       const args = ["-hide_banner", "-loglevel", "error"];
