@@ -18,10 +18,10 @@ File Forge relies on powerful CLI tools to handle conversions. Support depends o
   - Outputs: `png`, `jpg`, `webp`, etc.
 - **Audio** (requires **FFmpeg**):
   - Inputs: `mp3`, `wav`, `aac`, `flac`, `ogg`, `m4a`, etc.
-  - Outputs: `wav`, `mp3`, `aac`.
+  - Outputs: `wav`, `mp3`, `aac`, `flac`, `m4a`, `ogg`, etc.
 - **Video** (requires **FFmpeg**):
   - Inputs: `mp4`, `mov`, `mkv`, `webm`, `avi`, etc.
-  - Outputs: `mp4`, `mov`, `mkv`.
+  - Outputs: `mp4`, `mov`, `mkv`, `webm`, or extracted audio such as `mp3`, `m4a`, and `wav`.
 - **Documents** (requires **Pandoc** or **LibreOffice**):
   - **Pandoc**: Markdown, HTML, Org-mode, etc.
   - **LibreOffice**: `docx`, `xlsx`, `pptx`, `odt` to `pdf`, `pdf` to `txt`, etc.

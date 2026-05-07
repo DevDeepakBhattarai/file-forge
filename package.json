@@ -11,14 +11,14 @@
       "title": "Convert Clipboard File",
       "description": "Convert a file from clipboard",
       "mode": "view",
-      "subtitle": ""
+      "subtitle": "Clipboard"
     },
     {
       "name": "convert-file",
       "title": "Convert File",
       "description": "Convert a selected file",
       "mode": "view",
-      "subtitle": ""
+      "subtitle": "File"
     }
   ],
   "preferences": [

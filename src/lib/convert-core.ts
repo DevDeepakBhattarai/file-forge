@@ -1,11 +1,11 @@
 import { Clipboard } from "@raycast/api";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { access, readdir } from "node:fs/promises";
+import { access, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { getPreferenceValues } from "@raycast/api";
 
 const execFileAsync = promisify(execFile);
@@ -35,6 +35,14 @@ export type ConverterDecision = {
   defaultOutput: string;
 };
 
+export type ClipboardFileKind = "file" | "image";
+
+export type ClipboardFileEntry = {
+  path: string;
+  signature: string;
+  kind: ClipboardFileKind;
+};
+
 const toolCache: Partial<Record<ConverterKind, ToolFormats | null>> = {};
 const preferences = getPreferenceValues<Preferences>();
 
@@ -56,28 +64,41 @@ export const imagePreferredExts = new Set([
   "tga",
 ]);
 
-const audioExts = new Set([
+const audioExts = new Set(["aac", "aiff", "alac", "flac", "m4a", "mp3", "ogg", "opus", "wav", "wma"]);
+
+const videoExts = new Set([
+  "3g2",
+  "3gp",
+  "avi",
+  "flv",
+  "m2ts",
+  "m4v",
+  "mkv",
+  "mov",
+  "mp4",
+  "mpeg",
+  "mpg",
+  "mts",
+  "ogv",
+  "ts",
+  "webm",
+  "wmv",
+]);
+
+const ffmpegCommonOutputExts = new Set([
   "aac",
-  "aiff",
-  "alac",
   "flac",
   "m4a",
   "mp3",
   "ogg",
   "opus",
   "wav",
-  "wma",
-]);
-
-const videoExts = new Set([
   "avi",
+  "m4v",
   "mkv",
   "mov",
   "mp4",
-  "m4v",
   "webm",
-  "wmv",
-  "flv",
 ]);
 
 const libreOfficeInput = [
@@ -127,7 +148,7 @@ const resolvePreferred = async (value: string | undefined, probeArgs: string[]) 
 };
 
 const findBinary = async (cmd: string): Promise<string | null> => {
-  const locator = isWindows ? "where" : "which";
+  const locator = isWindows ? "where.exe" : "which";
   try {
     const { stdout } = await execFileAsync(locator, [cmd], {
       windowsHide: true,
@@ -136,6 +157,19 @@ const findBinary = async (cmd: string): Promise<string | null> => {
     if (first) return first;
   } catch {
     // ignore
+  }
+  return null;
+};
+
+const findExistingExecutable = async (candidates: Array<string | undefined | null>) => {
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      await access(candidate);
+      return candidate;
+    } catch {
+      // ignore
+    }
   }
   return null;
 };
@@ -195,8 +229,27 @@ const ensureMagick = async (): Promise<ToolFormats | null> => {
 
 const ensureFfmpeg = async (): Promise<ToolFormats | null> => {
   if (toolCache.ffmpeg !== undefined) return toolCache.ffmpeg ?? null;
-  const preferred = await resolvePreferred(preferences.ffmpegPath, ["-version"]);
-  const bin = preferred ?? ((await findBinary("ffmpeg")) ? "ffmpeg" : null);
+  let bin = await resolvePreferred(preferences.ffmpegPath, ["-version"]);
+  if (!bin) {
+    bin = await findBinary("ffmpeg");
+  }
+  if (!bin && isWindows) {
+    bin = await findExistingExecutable([
+      "C:\\ffmpeg\\bin\\ffmpeg.exe",
+      path.join(os.homedir(), "scoop", "shims", "ffmpeg.exe"),
+      path.join(
+        os.homedir(),
+        "AppData",
+        "Local",
+        "Microsoft",
+        "WinGet",
+        "Packages",
+        "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe",
+        "ffmpeg.exe",
+      ),
+      process.env["ChocolateyInstall"] ? path.join(process.env["ChocolateyInstall"], "bin", "ffmpeg.exe") : null,
+    ]);
+  }
   if (!bin) {
     toolCache.ffmpeg = null;
     return null;
@@ -291,13 +344,13 @@ const loadMagickFormats = async (bin: string) => {
 
 const loadFfmpegFormats = async (bin: string) => {
   try {
-    const { stdout } = await execFileAsync(bin, ["-hide_banner", "-formats"], {
+    const { stdout, stderr } = await execFileAsync(bin, ["-hide_banner", "-formats"], {
       windowsHide: true,
       maxBuffer: 1024 * 1024 * 10,
     });
     const input: string[] = [];
     const output: string[] = [];
-    for (const line of stdout.split(/\r?\n/)) {
+    for (const line of `${stdout}\n${stderr}`.split(/\r?\n/)) {
       const match = line.match(/^\s*([D.])([E.])\s+(\S+)/);
       if (!match) continue;
       const demux = match[1] === "D";
@@ -306,9 +359,15 @@ const loadFfmpegFormats = async (bin: string) => {
       if (demux) input.push(...formats);
       if (mux) output.push(...formats);
     }
-    return { input: uniqueSorted(input), output: uniqueSorted(output) };
+    return {
+      input: uniqueSorted([...input, ...audioExts, ...videoExts]),
+      output: uniqueSorted([...output, ...ffmpegCommonOutputExts]),
+    };
   } catch {
-    return { input: [], output: [] };
+    return {
+      input: uniqueSorted([...audioExts, ...videoExts]),
+      output: uniqueSorted([...ffmpegCommonOutputExts]),
+    };
   }
 };
 
@@ -344,7 +403,7 @@ export const pickDefaultOutput = (category: FileCategory, outputs: string[]) => 
   const preferredByCategory: Record<FileCategory, string[]> = {
     image: ["png", "jpg", "jpeg", "webp"],
     audio: ["wav", "mp3", "aac"],
-    video: ["mp4", "mov", "mkv"],
+    video: ["mp3", "m4a", "wav", "mp4", "mov", "mkv"],
     doc: ["pdf", "docx", "txt"],
     unknown: ["png", "pdf", "mp4"],
   };
@@ -355,11 +414,23 @@ export const pickDefaultOutput = (category: FileCategory, outputs: string[]) => 
   return outputs[0] ?? preferred[0] ?? "png";
 };
 
+export const getRecommendedOutputs = (category: FileCategory, outputs: string[]) => {
+  const preferredByCategory: Record<FileCategory, string[]> = {
+    image: ["png", "jpg", "jpeg", "webp"],
+    audio: ["wav", "mp3", "aac", "flac", "m4a", "ogg"],
+    video: ["mp3", "m4a", "wav", "aac", "mp4", "mov", "mkv", "webm"],
+    doc: ["pdf", "docx", "txt", "html"],
+    unknown: ["png", "pdf", "mp4"],
+  };
+  return preferredByCategory[category].filter((format) => outputs.length === 0 || outputs.includes(format));
+};
+
 export const detectConverter = async (ext: string): Promise<ConverterDecision | null> => {
   const magick = await ensureMagick();
   const ffmpeg = await ensureFfmpeg();
   const pandoc = await ensurePandoc();
   const libreoffice = await ensureLibreOffice();
+  const isKnownMediaExt = audioExts.has(ext) || videoExts.has(ext);
 
   if (imagePreferredExts.has(ext) && magick?.input.includes(ext)) {
     const category = getCategory(ext, "magick");
@@ -378,6 +449,9 @@ export const detectConverter = async (ext: string): Promise<ConverterDecision | 
       category,
       defaultOutput: pickDefaultOutput(category, ffmpeg.output),
     };
+  }
+  if (isKnownMediaExt) {
+    return null;
   }
   if (pandoc?.input.includes(ext)) {
     const category = getCategory(ext, "pandoc");
@@ -501,7 +575,11 @@ export const convertWithTool = async (opts: {
     case "ffmpeg": {
       const args = ["-hide_banner", "-loglevel", "error"];
       args.push(overwrite ? "-y" : "-n");
-      args.push("-i", inputPath, outputPath);
+      args.push("-i", inputPath);
+      if (audioExts.has(outputExtNormalized)) {
+        args.push("-vn");
+      }
+      args.push(outputPath);
       await runCommand(tool.bin, args);
       return outputPath;
     }
@@ -534,23 +612,68 @@ export const buildOutputPath = (
   return path.join(dir, `${baseName}.${safeExt}`);
 };
 
-export const readClipboardFile = async (): Promise<string | null> => {
+const getFileSignature = async (filePath: string) => {
+  try {
+    const stats = await stat(filePath);
+    return `file:${filePath}:${stats.size}:${stats.mtimeMs}`;
+  } catch {
+    return `file:${filePath}`;
+  }
+};
+
+const getImageSignature = async (filePath: string) => {
+  try {
+    const image = await readFile(filePath);
+    return `image:${createHash("sha256").update(image).digest("hex")}`;
+  } catch {
+    try {
+      const stats = await stat(filePath);
+      return `image:size:${stats.size}`;
+    } catch {
+      return "image:unknown";
+    }
+  }
+};
+
+export const readClipboardFileEntry = async (): Promise<ClipboardFileEntry | null> => {
   const content = await Clipboard.read();
-  if (content.file) return content.file;
+  if (content.file) {
+    const resolvedPath = content.file.startsWith("file://") ? fileURLToPath(content.file) : content.file;
+    return {
+      path: resolvedPath,
+      signature: await getFileSignature(resolvedPath),
+      kind: "file",
+    };
+  }
   if (content.text) {
     const trimmed = content.text.trim();
     if (!trimmed) return null;
     const pathCandidate = trimmed.startsWith("file://") ? fileURLToPath(trimmed) : trimmed;
     try {
       await access(pathCandidate);
-      return pathCandidate;
+      return {
+        path: pathCandidate,
+        signature: await getFileSignature(pathCandidate),
+        kind: "file",
+      };
     } catch {
       return null;
     }
   }
   const imagePath = await readClipboardImageToTemp();
-  if (imagePath) return imagePath;
+  if (imagePath) {
+    return {
+      path: imagePath,
+      signature: await getImageSignature(imagePath),
+      kind: "image",
+    };
+  }
   return null;
+};
+
+export const readClipboardFile = async (): Promise<string | null> => {
+  const entry = await readClipboardFileEntry();
+  return entry?.path ?? null;
 };
 
 const readClipboardImageToTemp = async (): Promise<string | null> => {
@@ -571,11 +694,10 @@ const readClipboardImageWindows = async (): Promise<string | null> => {
     "$img.Dispose();",
   ].join(" ");
   try {
-    await execFileAsync(
-      "powershell",
-      ["-NoProfile", "-NonInteractive", "-Command", script],
-      { windowsHide: true, maxBuffer: 1024 * 1024 },
-    );
+    await execFileAsync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+    });
     await access(tempPath);
     return tempPath;
   } catch {

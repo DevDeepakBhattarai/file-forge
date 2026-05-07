@@ -1,15 +1,17 @@
-import { Action, ActionPanel, Clipboard, Form, Icon, Toast, open, showToast } from "@raycast/api";
-import { useEffect, useMemo, useState } from "react";
+import { Action, ActionPanel, Clipboard, Form, Icon, LocalStorage, Toast, open, showToast } from "@raycast/api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { unlink } from "node:fs/promises";
 import {
+  ClipboardFileEntry,
   ConverterDecision,
   OutputDestination,
   buildOutputPath,
   convertWithTool,
   detectConverter,
   getFileExt,
+  getRecommendedOutputs,
   normalizeExt,
-  pickDefaultOutput,
-  readClipboardFile,
+  readClipboardFileEntry,
 } from "./lib/convert-core";
 
 type ConvertFormValues = {
@@ -20,38 +22,134 @@ type ConvertFormValues = {
   openAfter: boolean;
 };
 
+type PersistedFormState = {
+  outputFormat?: string;
+  destination?: OutputDestination;
+  outputDir?: string | null;
+  overwrite?: boolean;
+  openAfter?: boolean;
+};
+
+const FORM_STATE_KEY = "convert-clipboard-form-state-v1";
+const CLIPBOARD_POLL_MS = 1200;
+
+const isOutputDestination = (value: string): value is OutputDestination =>
+  value === "clipboard" || value === "save" || value === "both";
+
 export default function Command() {
-  const [inputPath, setInputPath] = useState<string | null>(null);
+  const [clipboardEntry, setClipboardEntry] = useState<ClipboardFileEntry | null>(null);
   const [decision, setDecision] = useState<ConverterDecision | null>(null);
   const [outputFormat, setOutputFormat] = useState<string>("");
   const [destination, setDestination] = useState<OutputDestination>("clipboard");
-  const [loading, setLoading] = useState(true);
+  const [outputDir, setOutputDir] = useState<string[]>([]);
+  const [overwrite, setOverwrite] = useState(false);
+  const [openAfter, setOpenAfter] = useState(true);
+  const [clipboardLoading, setClipboardLoading] = useState(true);
+  const [detecting, setDetecting] = useState(false);
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
+  const clipboardRefreshInFlight = useRef(false);
 
-  const loadClipboard = async () => {
-    setLoading(true);
-    const file = await readClipboardFile();
-    setInputPath(file);
-    setLoading(false);
-  };
+  const inputPath = clipboardEntry?.path ?? null;
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadFormState = async () => {
+      try {
+        const raw = await LocalStorage.getItem<string>(FORM_STATE_KEY);
+        if (cancelled || !raw) return;
+        const state = JSON.parse(raw) as PersistedFormState;
+        if (state.outputFormat) setOutputFormat(normalizeExt(state.outputFormat));
+        if (state.destination && isOutputDestination(state.destination)) setDestination(state.destination);
+        if (state.outputDir) setOutputDir([state.outputDir]);
+        if (typeof state.overwrite === "boolean") setOverwrite(state.overwrite);
+        if (typeof state.openAfter === "boolean") setOpenAfter(state.openAfter);
+      } catch {
+        // ignore malformed persisted state
+      } finally {
+        if (!cancelled) setPrefsLoaded(true);
+      }
+    };
+    void loadFormState();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!prefsLoaded) return;
+    const state: PersistedFormState = {
+      outputFormat: outputFormat || undefined,
+      destination,
+      outputDir: outputDir[0] ?? null,
+      overwrite,
+      openAfter,
+    };
+    void LocalStorage.setItem(FORM_STATE_KEY, JSON.stringify(state));
+  }, [destination, openAfter, outputDir, outputFormat, overwrite, prefsLoaded]);
+
+  const applyClipboardEntry = useCallback((nextEntry: ClipboardFileEntry | null) => {
+    setClipboardEntry((previousEntry) => {
+      if (!nextEntry) return null;
+      if (previousEntry && previousEntry.signature === nextEntry.signature && previousEntry.kind === nextEntry.kind) {
+        if (nextEntry.kind === "image" && nextEntry.path !== previousEntry.path) {
+          void unlink(nextEntry.path).catch(() => undefined);
+        }
+        return previousEntry;
+      }
+      return nextEntry;
+    });
+  }, []);
+
+  const loadClipboard = useCallback(async () => {
+    if (clipboardRefreshInFlight.current) return;
+    clipboardRefreshInFlight.current = true;
+    try {
+      const entry = await readClipboardFileEntry();
+      applyClipboardEntry(entry);
+    } finally {
+      clipboardRefreshInFlight.current = false;
+      setClipboardLoading(false);
+    }
+  }, [applyClipboardEntry, clipboardRefreshInFlight]);
 
   useEffect(() => {
     void loadClipboard();
-  }, []);
+    const interval = setInterval(() => {
+      void loadClipboard();
+    }, CLIPBOARD_POLL_MS);
+    return () => {
+      clearInterval(interval);
+    };
+  }, [loadClipboard]);
 
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       if (!inputPath) {
         setDecision(null);
-        setOutputFormat("");
+        setDetecting(false);
         return;
       }
-      setLoading(true);
-      const resolved = await detectConverter(getFileExt(inputPath));
-      if (cancelled) return;
-      setDecision(resolved);
-      setOutputFormat(resolved?.defaultOutput ?? "");
-      setLoading(false);
+      setDetecting(true);
+      try {
+        const resolved = await detectConverter(getFileExt(inputPath));
+        if (cancelled) return;
+        setDecision(resolved);
+        if (resolved) {
+          setOutputFormat((currentFormat) => {
+            const normalizedCurrent = normalizeExt(currentFormat);
+            if (
+              normalizedCurrent &&
+              (resolved.tool.output.length === 0 || resolved.tool.output.includes(normalizedCurrent))
+            ) {
+              return normalizedCurrent;
+            }
+            return resolved.defaultOutput;
+          });
+        }
+      } finally {
+        if (!cancelled) setDetecting(false);
+      }
     };
     void load();
     return () => {
@@ -62,16 +160,15 @@ export default function Command() {
   const outputFormats = decision?.tool.output ?? [];
   const recommended = useMemo(() => {
     if (!decision) return { recommended: [], all: [] as string[] };
-    const recommendedSet = new Set<string>();
+    const recommendedSet = new Set(getRecommendedOutputs(decision.category, outputFormats));
     if (decision.defaultOutput) recommendedSet.add(decision.defaultOutput);
-    const preferred = pickDefaultOutput(decision.category, outputFormats);
-    if (preferred) recommendedSet.add(preferred);
     const recommendedList = Array.from(recommendedSet);
     const remaining = outputFormats.filter((format) => !recommendedSet.has(format));
     return { recommended: recommendedList, all: remaining };
   }, [decision, outputFormats]);
 
   const handleSubmit = async (values: ConvertFormValues) => {
+    void values;
     if (!inputPath) {
       await showToast(Toast.Style.Failure, "No clipboard file found");
       return;
@@ -88,7 +185,7 @@ export default function Command() {
       await showToast(Toast.Style.Failure, "No compatible converter found");
       return;
     }
-    const outputExt = normalizeExt(values.outputFormat || outputFormat || resolvedDecision.defaultOutput);
+    const outputExt = normalizeExt(outputFormat || resolvedDecision.defaultOutput);
     if (!outputExt) {
       await showToast(Toast.Style.Failure, "Choose a target format");
       return;
@@ -102,11 +199,8 @@ export default function Command() {
       );
       return;
     }
-    const outputDir =
-      values.destination === "save" || values.destination === "both"
-        ? values.outputDir?.[0] ?? null
-        : null;
-    const outputPath = buildOutputPath(inputPath, outputExt, outputDir, values.destination);
+    const outputDirPath = destination === "save" || destination === "both" ? (outputDir?.[0] ?? null) : null;
+    const outputPath = buildOutputPath(inputPath, outputExt, outputDirPath, destination);
 
     const toast = await showToast({
       style: Toast.Style.Animated,
@@ -124,15 +218,15 @@ export default function Command() {
         tool: resolvedDecision.tool,
       });
 
-      if (values.destination === "clipboard" || values.destination === "both") {
+      if (destination === "clipboard" || destination === "both") {
         await Clipboard.copy({ file: resultPath });
       }
 
       toast.style = Toast.Style.Success;
-      toast.title = values.destination === "clipboard" ? "Copied to clipboard" : "Conversion complete";
+      toast.title = destination === "clipboard" ? "Copied to clipboard" : "Conversion complete";
       toast.message = resultPath;
 
-      if ((values.destination === "save" || values.destination === "both") && values.openAfter) {
+      if ((destination === "save" || destination === "both") && openAfter) {
         await open(resultPath);
       }
     } catch (error) {
@@ -144,11 +238,11 @@ export default function Command() {
 
   return (
     <Form
-      isLoading={loading}
+      isLoading={clipboardLoading || detecting || !prefsLoaded}
       actions={
         <ActionPanel>
           <Action.SubmitForm icon={Icon.ArrowRight} title="Convert" onSubmit={handleSubmit} />
-          <Action icon={Icon.Clipboard} title="Reload Clipboard" onAction={loadClipboard} />
+          <Action icon={Icon.Clipboard} title="Reload Clipboard" onAction={() => void loadClipboard()} />
         </ActionPanel>
       }
     >
@@ -162,7 +256,7 @@ export default function Command() {
           title="Target Format"
           placeholder="Search formats..."
           value={outputFormat}
-          onChange={setOutputFormat}
+          onChange={(value) => setOutputFormat(normalizeExt(value))}
         >
           {recommended.recommended.length > 0 && (
             <Form.Dropdown.Section title="Recommended">
@@ -178,7 +272,12 @@ export default function Command() {
           </Form.Dropdown.Section>
         </Form.Dropdown>
       ) : (
-        <Form.TextField id="outputFormat" title="Target Format" value={outputFormat} onChange={setOutputFormat} />
+        <Form.TextField
+          id="outputFormat"
+          title="Target Format"
+          value={outputFormat}
+          onChange={(value) => setOutputFormat(normalizeExt(value))}
+        />
       )}
       <Form.Dropdown
         id="destination"
@@ -197,16 +296,25 @@ export default function Command() {
           canChooseDirectories={true}
           canChooseFiles={false}
           allowMultipleSelection={false}
+          value={outputDir}
+          onChange={setOutputDir}
         />
       )}
       <Form.Checkbox
         id="overwrite"
         title="Overwrite Existing File"
         label="Overwrite if output already exists"
-        defaultValue={false}
+        value={overwrite}
+        onChange={setOverwrite}
       />
       {(destination === "save" || destination === "both") && (
-        <Form.Checkbox id="openAfter" title="Open After Convert" label="Open the converted file" defaultValue={true} />
+        <Form.Checkbox
+          id="openAfter"
+          title="Open After Convert"
+          label="Open the converted file"
+          value={openAfter}
+          onChange={setOpenAfter}
+        />
       )}
     </Form>
   );
