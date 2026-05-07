@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import { access, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import { getPreferenceValues } from "@raycast/api";
 
@@ -101,6 +101,66 @@ const ffmpegCommonOutputExts = new Set([
   "webm",
 ]);
 
+const pandocInputExts = new Set([
+  "adoc",
+  "asciidoc",
+  "bib",
+  "csv",
+  "docbook",
+  "docx",
+  "epub",
+  "htm",
+  "html",
+  "ipynb",
+  "json",
+  "latex",
+  "ltx",
+  "md",
+  "mdown",
+  "markdown",
+  "mkd",
+  "odt",
+  "opml",
+  "org",
+  "pptx",
+  "rst",
+  "rtf",
+  "tex",
+  "textile",
+  "tsv",
+  "typ",
+  "typst",
+  "wiki",
+  "xls",
+  "xlsx",
+  "xml",
+]);
+
+const pandocCommonOutputExts = new Set([
+  "adoc",
+  "asciidoc",
+  "docx",
+  "epub",
+  "htm",
+  "html",
+  "ipynb",
+  "json",
+  "latex",
+  "md",
+  "odt",
+  "opml",
+  "org",
+  "pdf",
+  "pptx",
+  "rst",
+  "rtf",
+  "tex",
+  "txt",
+  "typ",
+  "typst",
+  "xml",
+]);
+
 const libreOfficeInput = [
   "doc",
   "docx",
@@ -172,6 +232,27 @@ const findExistingExecutable = async (candidates: Array<string | undefined | nul
     }
   }
   return null;
+};
+
+const findBrowserForPdf = async () => {
+  const resolved = await findBinary(isWindows ? "msedge" : "google-chrome");
+  if (resolved) return resolved;
+
+  if (isWindows) {
+    return await findExistingExecutable([
+      "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+      "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+      path.join(os.homedir(), "AppData", "Local", "Google", "Chrome", "Application", "chrome.exe"),
+    ]);
+  }
+
+  return await findExistingExecutable([
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+  ]);
 };
 
 const findMagickOnWindows = async (): Promise<string | null> => {
@@ -261,8 +342,18 @@ const ensureFfmpeg = async (): Promise<ToolFormats | null> => {
 
 const ensurePandoc = async (): Promise<ToolFormats | null> => {
   if (toolCache.pandoc !== undefined) return toolCache.pandoc ?? null;
-  const preferred = await resolvePreferred(preferences.pandocPath, ["--version"]);
-  const bin = preferred ?? ((await findBinary("pandoc")) ? "pandoc" : null);
+  let bin = await resolvePreferred(preferences.pandocPath, ["--version"]);
+  if (!bin) {
+    bin = await findBinary("pandoc");
+  }
+  if (!bin && isWindows) {
+    bin = await findExistingExecutable([
+      path.join(os.homedir(), "AppData", "Local", "Pandoc", "pandoc.exe"),
+      process.env["ProgramData"] ? path.join(process.env["ProgramData"], "chocolatey", "bin", "pandoc.exe") : null,
+      process.env["ChocolateyInstall"] ? path.join(process.env["ChocolateyInstall"], "bin", "pandoc.exe") : null,
+      path.join(os.homedir(), "scoop", "shims", "pandoc.exe"),
+    ]);
+  }
   if (!bin) {
     toolCache.pandoc = null;
     return null;
@@ -383,11 +474,20 @@ const loadPandocFormats = async (bin: string) => {
         maxBuffer: 1024 * 1024,
       }),
     ]);
-    const input = uniqueSorted(inputResult.stdout.split(/\s+/).map((format) => normalizeExt(format)));
-    const output = uniqueSorted(outputResult.stdout.split(/\s+/).map((format) => normalizeExt(format)));
+    const input = uniqueSorted([
+      ...inputResult.stdout.split(/\s+/).map((format) => normalizeExt(format)),
+      ...pandocInputExts,
+    ]);
+    const output = uniqueSorted([
+      ...outputResult.stdout.split(/\s+/).map((format) => normalizeExt(format)),
+      ...pandocCommonOutputExts,
+    ]);
     return { input, output };
   } catch {
-    return { input: [], output: [] };
+    return {
+      input: uniqueSorted([...pandocInputExts]),
+      output: uniqueSorted([...pandocCommonOutputExts]),
+    };
   }
 };
 
@@ -404,7 +504,7 @@ export const pickDefaultOutput = (category: FileCategory, outputs: string[]) => 
     image: ["png", "jpg", "jpeg", "webp"],
     audio: ["wav", "mp3", "aac"],
     video: ["mp3", "m4a", "wav", "mp4", "mov", "mkv"],
-    doc: ["pdf", "docx", "txt"],
+    doc: ["pdf", "docx", "html", "md", "txt"],
     unknown: ["png", "pdf", "mp4"],
   };
   const preferred = preferredByCategory[category] ?? [];
@@ -419,7 +519,7 @@ export const getRecommendedOutputs = (category: FileCategory, outputs: string[])
     image: ["png", "jpg", "jpeg", "webp"],
     audio: ["wav", "mp3", "aac", "flac", "m4a", "ogg"],
     video: ["mp3", "m4a", "wav", "aac", "mp4", "mov", "mkv", "webm"],
-    doc: ["pdf", "docx", "txt", "html"],
+    doc: ["pdf", "docx", "html", "md", "txt", "pptx", "epub"],
     unknown: ["png", "pdf", "mp4"],
   };
   return preferredByCategory[category].filter((format) => outputs.length === 0 || outputs.includes(format));
@@ -431,6 +531,7 @@ export const detectConverter = async (ext: string): Promise<ConverterDecision | 
   const pandoc = await ensurePandoc();
   const libreoffice = await ensureLibreOffice();
   const isKnownMediaExt = audioExts.has(ext) || videoExts.has(ext);
+  const isKnownDocExt = pandocInputExts.has(ext) || libreOfficeInput.includes(ext);
 
   if (imagePreferredExts.has(ext) && magick?.input.includes(ext)) {
     const category = getCategory(ext, "magick");
@@ -470,6 +571,9 @@ export const detectConverter = async (ext: string): Promise<ConverterDecision | 
       category,
       defaultOutput: pickDefaultOutput(category, libreoffice.output),
     };
+  }
+  if (isKnownDocExt) {
+    return null;
   }
   if (magick?.input.includes(ext)) {
     const category = getCategory(ext, "magick");
@@ -535,6 +639,63 @@ export const runCommand = async (cmd: string, args: string[]) => {
   }
 };
 
+const isMissingPandocPdfEngineError = (error: unknown) => {
+  if (!(error instanceof Error)) return false;
+  return /pdflatex not found|xelatex not found|lualatex not found|pdf engine|--pdf-engine/i.test(error.message);
+};
+
+const hasPandocPdfEngine = async () => {
+  const engines = ["pdflatex", "xelatex", "lualatex", "typst", "wkhtmltopdf", "weasyprint", "prince"];
+  for (const engine of engines) {
+    const resolved = await findBinary(engine);
+    if (resolved && (await canRun(resolved, ["--version"]))) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const waitForFile = async (filePath: string, timeoutMs = 5000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await access(filePath);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  await access(filePath);
+};
+
+const convertPandocPdfViaBrowser = async (tool: ToolFormats, inputPath: string, outputPath: string) => {
+  const browser = await findBrowserForPdf();
+  if (!browser) {
+    throw new Error(
+      "Pandoc can read this file, but PDF output needs a PDF engine. Install LaTeX, Typst, wkhtmltopdf, Edge, or Chrome.",
+    );
+  }
+
+  const htmlPath = path.join(os.tmpdir(), `file-forge-pandoc-${randomUUID()}.html`);
+  const browserUserDataDir = path.join(os.tmpdir(), `file-forge-browser-${randomUUID()}`);
+  await runCommand(tool.bin, [inputPath, "--standalone", "-o", htmlPath]);
+  await runCommand(browser, [
+    "--headless",
+    "--disable-gpu",
+    "--no-first-run",
+    `--user-data-dir=${browserUserDataDir}`,
+    "--allow-file-access-from-files",
+    `--print-to-pdf=${outputPath}`,
+    pathToFileURL(htmlPath).toString(),
+  ]);
+
+  try {
+    await waitForFile(outputPath);
+  } catch {
+    throw new Error("Browser PDF fallback finished but did not create an output PDF.");
+  }
+};
+
 export const convertWithTool = async (opts: {
   inputPath: string;
   outputPath: string;
@@ -584,7 +745,22 @@ export const convertWithTool = async (opts: {
       return outputPath;
     }
     case "pandoc":
-      await runCommand(tool.bin, [inputPath, "-o", outputPath]);
+      if (outputExtNormalized === "pdf" && !(await hasPandocPdfEngine())) {
+        await convertPandocPdfViaBrowser(tool, inputPath, outputPath);
+        return outputPath;
+      }
+      try {
+        await runCommand(tool.bin, [inputPath, "-o", outputPath]);
+      } catch (error) {
+        if (outputExtNormalized !== "pdf") {
+          throw error;
+        }
+        if (!isMissingPandocPdfEngineError(error)) {
+          await convertPandocPdfViaBrowser(tool, inputPath, outputPath);
+          return outputPath;
+        }
+        await convertPandocPdfViaBrowser(tool, inputPath, outputPath);
+      }
       return outputPath;
     case "libreoffice": {
       const outDir = path.dirname(outputPath);

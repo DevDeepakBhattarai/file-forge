@@ -23,7 +23,8 @@ File Forge relies on powerful CLI tools to handle conversions. Support depends o
   - Inputs: `mp4`, `mov`, `mkv`, `webm`, `avi`, etc.
   - Outputs: `mp4`, `mov`, `mkv`, `webm`, or extracted audio such as `mp3`, `m4a`, and `wav`.
 - **Documents** (requires **Pandoc** or **LibreOffice**):
-  - **Pandoc**: Markdown, HTML, Org-mode, etc.
+  - **Pandoc**: Markdown (`md`, `markdown`), HTML, Org-mode, reStructuredText, LaTeX, EPUB, notebooks, and more.
+  - Pandoc PDF output uses Pandoc's configured PDF engine when available, then falls back to headless Edge/Chrome.
   - **LibreOffice**: `docx`, `xlsx`, `pptx`, `odt` to `pdf`, `pdf` to `txt`, etc.
 
 ## Prerequisites
