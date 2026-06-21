@@ -655,17 +655,42 @@ const hasPandocPdfEngine = async () => {
   return false;
 };
 
-const waitForFile = async (filePath: string, timeoutMs = 5000) => {
+const assertOutputDoesNotExist = async (filePath: string) => {
+  try {
+    await access(filePath);
+  } catch {
+    return;
+  }
+  throw new Error("Output file already exists. Enable overwrite or choose another name.");
+};
+
+const isValidPdf = async (filePath: string) => {
+  try {
+    const buffer = await readFile(filePath);
+    if (buffer.length < 8) return false;
+
+    const header = buffer.subarray(0, 8).toString("latin1");
+    const trailer = buffer.subarray(Math.max(0, buffer.length - 2048)).toString("latin1");
+    return header.startsWith("%PDF-") && trailer.includes("%%EOF");
+  } catch {
+    return false;
+  }
+};
+
+const assertValidPdf = async (filePath: string) => {
+  if (await isValidPdf(filePath)) return;
+  throw new Error("Conversion finished, but the generated file is not a valid PDF.");
+};
+
+const waitForValidPdf = async (filePath: string, timeoutMs = 10000) => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    try {
-      await access(filePath);
+    if (await isValidPdf(filePath)) {
       return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 100));
     }
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  await access(filePath);
+  await assertValidPdf(filePath);
 };
 
 const convertPandocPdfViaBrowser = async (tool: ToolFormats, inputPath: string, outputPath: string) => {
@@ -689,11 +714,74 @@ const convertPandocPdfViaBrowser = async (tool: ToolFormats, inputPath: string, 
     pathToFileURL(htmlPath).toString(),
   ]);
 
+  await waitForValidPdf(outputPath);
+};
+
+const SVG_4K_LONG_EDGE = 3840;
+
+const parseSvgLengthPx = (value: string | null) => {
+  if (!value) return null;
+  const match = value.trim().match(/^([+-]?\d*\.?\d+(?:e[+-]?\d+)?)\s*([a-z%]*)$/i);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  const unit = match[2].toLowerCase();
+  const pxByUnit: Record<string, number> = {
+    "": 1,
+    px: 1,
+    in: 96,
+    cm: 96 / 2.54,
+    mm: 96 / 25.4,
+    pt: 96 / 72,
+    pc: 16,
+  };
+  const multiplier = pxByUnit[unit];
+  return multiplier ? amount * multiplier : null;
+};
+
+const getSvgAttribute = (tag: string, name: string) => {
+  const match = tag.match(new RegExp(`\\s${name}\\s*=\\s*("([^"]*)"|'([^']*)')`, "i"));
+  return match?.[2] ?? match?.[3] ?? null;
+};
+
+const getSvgIntrinsicAspectRatio = async (filePath: string) => {
   try {
-    await waitForFile(outputPath);
+    const svg = await readFile(filePath, "utf8");
+    const svgTag = svg.match(/<svg\b[^>]*>/i)?.[0];
+    if (!svgTag) return null;
+
+    const width = parseSvgLengthPx(getSvgAttribute(svgTag, "width"));
+    const height = parseSvgLengthPx(getSvgAttribute(svgTag, "height"));
+    if (width && height) return width / height;
+
+    const viewBox = getSvgAttribute(svgTag, "viewBox");
+    const values = viewBox
+      ?.trim()
+      .split(/[\s,]+/)
+      .map((value) => Number(value));
+    const viewBoxWidth = values?.[2];
+    const viewBoxHeight = values?.[3];
+    if (viewBoxWidth && viewBoxHeight && viewBoxWidth > 0 && viewBoxHeight > 0) {
+      return viewBoxWidth / viewBoxHeight;
+    }
   } catch {
-    throw new Error("Browser PDF fallback finished but did not create an output PDF.");
+    // Fall back to a UHD viewport below.
   }
+  return null;
+};
+
+const getSvg4kRasterSize = async (filePath: string) => {
+  const aspectRatio = (await getSvgIntrinsicAspectRatio(filePath)) ?? 1;
+  if (aspectRatio >= 1) {
+    return {
+      width: SVG_4K_LONG_EDGE,
+      height: Math.max(1, Math.round(SVG_4K_LONG_EDGE / aspectRatio)),
+    };
+  }
+  return {
+    width: Math.max(1, Math.round(SVG_4K_LONG_EDGE * aspectRatio)),
+    height: SVG_4K_LONG_EDGE,
+  };
 };
 
 export const convertWithTool = async (opts: {
@@ -709,12 +797,7 @@ export const convertWithTool = async (opts: {
   const outputExtNormalized = normalizeExt(outputExt);
 
   if (!overwrite) {
-    try {
-      await access(outputPath);
-      throw new Error("Output file already exists. Enable overwrite or choose another name.");
-    } catch {
-      // file does not exist
-    }
+    await assertOutputDoesNotExist(outputPath);
   }
 
   switch (converter) {
@@ -722,12 +805,21 @@ export const convertWithTool = async (opts: {
       {
         const args: string[] = [];
         const alphaFormats = new Set(["png", "webp", "gif", "tif", "tiff"]);
+        const vectorOutputFormats = new Set(["svg", "pdf", "eps"]);
+        const shouldRenderSvgAt4k = inputExt === "svg" && !vectorOutputFormats.has(outputExtNormalized);
+        const svgRasterSize = shouldRenderSvgAt4k ? await getSvg4kRasterSize(inputPath) : null;
         if (inputExt === "svg" && alphaFormats.has(outputExtNormalized)) {
           args.push("-background", "none");
+        }
+        if (svgRasterSize) {
+          args.push("-density", "384", "-size", `${svgRasterSize.width}x${svgRasterSize.height}`);
         }
         args.push(inputPath);
         if (inputExt === "svg" && alphaFormats.has(outputExtNormalized)) {
           args.push("-alpha", "on");
+        }
+        if (svgRasterSize) {
+          args.push("-resize", `${svgRasterSize.width}x${svgRasterSize.height}`);
         }
         args.push(outputPath);
         await runCommand(tool.bin, args);
@@ -751,6 +843,9 @@ export const convertWithTool = async (opts: {
       }
       try {
         await runCommand(tool.bin, [inputPath, "-o", outputPath]);
+        if (outputExtNormalized === "pdf") {
+          await assertValidPdf(outputPath);
+        }
       } catch (error) {
         if (outputExtNormalized !== "pdf") {
           throw error;
