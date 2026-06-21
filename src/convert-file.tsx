@@ -4,6 +4,7 @@ import {
   ConverterDecision,
   OutputDestination,
   buildOutputPath,
+  convertImagesToPdf,
   convertWithTool,
   detectConverter,
   getFileExt,
@@ -11,6 +12,7 @@ import {
   normalizeExt,
 } from "./lib/convert-core";
 import { fileURLToPath } from "node:url";
+import path from "node:path";
 
 type ConvertFormValues = {
   input: string[];
@@ -35,8 +37,14 @@ type PersistedFormState = {
 const isOutputDestination = (value: string): value is OutputDestination =>
   value === "clipboard" || value === "save" || value === "both";
 
+type ConversionJob = {
+  inputPath: string;
+  outputPath: string;
+  decision: ConverterDecision;
+};
+
 export default function Command() {
-  const [inputPath, setInputPath] = useState<string | null>(null);
+  const [inputPaths, setInputPaths] = useState<string[]>([]);
   const [decision, setDecision] = useState<ConverterDecision | null>(null);
   const [outputFormat, setOutputFormat] = useState<string>("");
   const [destination, setDestination] = useState<OutputDestination>("clipboard");
@@ -45,6 +53,7 @@ export default function Command() {
   const [openAfter, setOpenAfter] = useState(true);
   const [detecting, setDetecting] = useState(false);
   const [prefsLoaded, setPrefsLoaded] = useState(false);
+  const primaryInputPath = inputPaths[0] ?? null;
 
   useEffect(() => {
     let cancelled = false;
@@ -85,14 +94,14 @@ export default function Command() {
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
-      if (!inputPath) {
+      if (!primaryInputPath) {
         setDecision(null);
         setDetecting(false);
         return;
       }
       setDetecting(true);
       try {
-        const resolved = await detectConverter(getFileExt(inputPath));
+        const resolved = await detectConverter(getFileExt(primaryInputPath));
         if (cancelled) return;
         setDecision(resolved);
         if (resolved) {
@@ -115,7 +124,7 @@ export default function Command() {
     return () => {
       cancelled = true;
     };
-  }, [inputPath]);
+  }, [primaryInputPath]);
 
   const outputFormats = decision?.tool.output ?? [];
   const recommended = useMemo(() => {
@@ -128,67 +137,120 @@ export default function Command() {
   }, [decision, outputFormats]);
 
   const handleSubmit = async (values: ConvertFormValues) => {
-    const rawInput = values.input?.[0] ?? inputPath;
-    if (!rawInput) {
-      await showToast(Toast.Style.Failure, "Select a file");
+    const selectedInputPaths = (values.input?.length ? values.input : inputPaths).map(normalizeInputPath);
+    if (selectedInputPaths.length === 0) {
+      await showToast(Toast.Style.Failure, "Select at least one file");
       return;
     }
-    const resolvedInput = normalizeInputPath(rawInput);
-    let resolvedDecision = decision;
-    if (!resolvedDecision || inputPath !== resolvedInput) {
-      resolvedDecision = await detectConverter(getFileExt(resolvedInput));
-      setDecision(resolvedDecision);
-      if (resolvedDecision && !outputFormat) {
-        setOutputFormat(resolvedDecision.defaultOutput);
+
+    const primaryInput = selectedInputPaths[0];
+    let primaryDecision = decision;
+    if (!primaryDecision || primaryInputPath !== primaryInput) {
+      primaryDecision = await detectConverter(getFileExt(primaryInput));
+      setDecision(primaryDecision);
+      if (primaryDecision && !outputFormat) {
+        setOutputFormat(primaryDecision.defaultOutput);
       }
     }
-    if (!resolvedDecision) {
-      await showToast(Toast.Style.Failure, "No compatible converter found");
+    if (!primaryDecision) {
+      await showToast(Toast.Style.Failure, "No compatible converter found", primaryInput);
       return;
     }
-    const outputExt = normalizeExt(values.outputFormat || outputFormat || resolvedDecision.defaultOutput);
+
+    const outputExt = normalizeExt(values.outputFormat || outputFormat || primaryDecision.defaultOutput);
     if (!outputExt) {
       await showToast(Toast.Style.Failure, "Choose a target format");
       return;
     }
-    const supportedOutputs = resolvedDecision.tool.output;
-    if (supportedOutputs.length > 0 && !supportedOutputs.includes(outputExt)) {
-      await showToast(
-        Toast.Style.Failure,
-        `.${outputExt} is not supported by ${resolvedDecision.kind}`,
-        "Choose a supported format from the dropdown.",
-      );
-      return;
+    const selectedDestination = values.destination;
+    const outputDirPath =
+      selectedDestination === "save" || selectedDestination === "both" ? (values.outputDir?.[0] ?? null) : null;
+
+    const conversionJobs: ConversionJob[] = [];
+    for (const inputPath of selectedInputPaths) {
+      const resolvedDecision = await detectConverter(getFileExt(inputPath));
+      if (!resolvedDecision) {
+        await showToast(Toast.Style.Failure, "No compatible converter found", inputPath);
+        return;
+      }
+      const supportedOutputs = resolvedDecision.tool.output;
+      if (supportedOutputs.length > 0 && !supportedOutputs.includes(outputExt)) {
+        await showToast(
+          Toast.Style.Failure,
+          `.${outputExt} is not supported by ${resolvedDecision.kind}`,
+          path.basename(inputPath),
+        );
+        return;
+      }
+      conversionJobs.push({
+        inputPath,
+        outputPath: buildOutputPath(inputPath, outputExt, outputDirPath, selectedDestination),
+        decision: resolvedDecision,
+      });
     }
-    const outputDirPath = destination === "save" || destination === "both" ? (outputDir?.[0] ?? null) : null;
-    const outputPath = buildOutputPath(resolvedInput, outputExt, outputDirPath, destination);
+    const shouldMergeImagesToPdf =
+      selectedInputPaths.length > 1 &&
+      outputExt === "pdf" &&
+      conversionJobs.every((job) => job.decision.kind === "magick" && job.decision.category === "image");
 
     const toast = await showToast({
       style: Toast.Style.Animated,
-      title: "Converting file",
-      message: `${resolvedDecision.kind} -> .${outputExt}`,
+      title: shouldMergeImagesToPdf
+        ? "Converting images to PDF"
+        : selectedInputPaths.length === 1
+          ? "Converting file"
+          : "Converting files",
+      message: `${selectedInputPaths.length} -> .${outputExt}`,
     });
 
     try {
-      const resultPath = await convertWithTool({
-        inputPath: resolvedInput,
-        outputPath,
-        outputExt,
-        overwrite: values.overwrite,
-        converter: resolvedDecision.kind,
-        tool: resolvedDecision.tool,
-      });
+      const resultPaths: string[] = [];
+      if (shouldMergeImagesToPdf) {
+        const firstJob = conversionJobs[0];
+        toast.message = `${selectedInputPaths.length} pages -> ${path.basename(firstJob.outputPath)}`;
+        resultPaths.push(
+          await convertImagesToPdf({
+            inputPaths: conversionJobs.map((job) => job.inputPath),
+            outputPath: firstJob.outputPath,
+            overwrite: values.overwrite,
+            tool: firstJob.decision.tool,
+          }),
+        );
+      } else {
+        for (const job of conversionJobs) {
+          toast.message = `${path.basename(job.inputPath)} -> .${outputExt}`;
+          resultPaths.push(
+            await convertWithTool({
+              inputPath: job.inputPath,
+              outputPath: job.outputPath,
+              outputExt,
+              overwrite: values.overwrite,
+              converter: job.decision.kind,
+              tool: job.decision.tool,
+            }),
+          );
+        }
+      }
 
-      if (destination === "clipboard" || destination === "both") {
-        await Clipboard.copy({ file: resultPath });
+      if (selectedDestination === "clipboard" || selectedDestination === "both") {
+        if (resultPaths.length === 1) {
+          await Clipboard.copy({ file: resultPaths[0] });
+        } else {
+          await Clipboard.copy(resultPaths.join("\n"));
+        }
       }
 
       toast.style = Toast.Style.Success;
-      toast.title = destination === "clipboard" ? "Copied to clipboard" : "Conversion complete";
-      toast.message = resultPath;
+      toast.title =
+        selectedDestination === "clipboard"
+          ? resultPaths.length === 1
+            ? "Copied to clipboard"
+            : "Copied output paths"
+          : "Conversion complete";
+      toast.message = resultPaths.length === 1 ? resultPaths[0] : `${resultPaths.length} files converted`;
 
-      if ((destination === "save" || destination === "both") && openAfter) {
-        await open(resultPath);
+      if ((selectedDestination === "save" || selectedDestination === "both") && values.openAfter) {
+        await open(resultPaths.length === 1 ? resultPaths[0] : outputDirPath || path.dirname(resultPaths[0]));
       }
     } catch (error) {
       toast.style = Toast.Style.Failure;
@@ -210,11 +272,10 @@ export default function Command() {
         id="input"
         title="Input File"
         canChooseDirectories={false}
-        allowMultipleSelection={false}
-        value={inputPath ? [inputPath] : []}
+        allowMultipleSelection={true}
+        value={inputPaths}
         onChange={(value) => {
-          const next = value?.[0];
-          setInputPath(next ? normalizeInputPath(next) : null);
+          setInputPaths(value.map(normalizeInputPath));
         }}
       />
       {outputFormats.length > 0 ? (

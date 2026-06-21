@@ -867,6 +867,24 @@ export const convertWithTool = async (opts: {
   }
 };
 
+export const convertImagesToPdf = async (opts: {
+  inputPaths: string[];
+  outputPath: string;
+  overwrite: boolean;
+  tool: ToolFormats;
+}) => {
+  const { inputPaths, outputPath, overwrite, tool } = opts;
+  if (inputPaths.length === 0) {
+    throw new Error("Select at least one image.");
+  }
+  if (!overwrite) {
+    await assertOutputDoesNotExist(outputPath);
+  }
+
+  await runCommand(tool.bin, [...inputPaths, outputPath]);
+  return outputPath;
+};
+
 export const buildOutputPath = (
   inputPath: string,
   outputExt: string,
