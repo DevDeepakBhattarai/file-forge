@@ -11,6 +11,7 @@ import {
   getRecommendedOutputs,
   normalizeExt,
 } from "./lib/convert-core";
+import { getSelectedFilePaths } from "./lib/selected-file-paths";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -54,6 +55,20 @@ export default function Command() {
   const [detecting, setDetecting] = useState(false);
   const [prefsLoaded, setPrefsLoaded] = useState(false);
   const primaryInputPath = inputPaths[0] ?? null;
+
+  useEffect(() => {
+    let cancelled = false;
+    void getSelectedFilePaths().then((selectedPaths) => {
+      if (!cancelled && selectedPaths.length > 0) {
+        setInputPaths((currentPaths) =>
+          currentPaths.length > 0 ? currentPaths : selectedPaths.map(normalizeInputPath),
+        );
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
